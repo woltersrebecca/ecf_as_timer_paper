@@ -1,0 +1,613 @@
+---
+title: "Two-step timer analysis"
+author: "Rebecca Wolters"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+---
+
+# Setup
+
+## Libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(MetBrewer)
+library(wellr)       # github: bradyajohnston/wellr
+library(broom)
+library(scales)
+library(reluxr)
+library(wesanderson)
+library(patchwork)
+```
+
+## Load functions
+
+```{r source}
+source("/Users/rebeccawolters/Desktop/Timer_Paper/Data_analysis/Twostep_timer/twosteptimer_functions_clean.R")
+```
+
+## Experiment parameters
+
+All experiment-level parameters are defined here. Change only this chunk
+when analysing a new experiment.
+
+```{r parameters}
+# ---- Timing ----------------------------------------------------------------
+it        <- 6      # arabinose induction time (hours)
+starttime <- 4      # time considered t=0 for this experiment (384-well = 4 h)
+
+# ---- Analysis --------------------------------------------------------------
+fc_threshold <- 4   # fold-change threshold for time delay calculation
+
+# ---- Plate format ----------------------------------------------------------
+# Pathlength correction factors (determined empirically)
+# 50 µl in 384-well = 3.09 | 100 µl in 96-well = 4.898
+pc_factor <- 3.09   # 384-well plates used for two-step timer
+
+# ---- File paths ------------------------------------------------------------
+data_files <- "/Users/rebeccawolters/Desktop/Timer_Paper/Data_analysis/Twostep_timer/Data"
+plot_dir   <- "/Users/rebeccawolters/Desktop/Timer_Paper/Data_analysis/Twostep_timer/Plots_all/test"
+
+# ---- Grouping variables ----------------------------------------------------
+# Both aTc and DHBA are included because two-step timer uses both inducers
+group_vars_av <- c("time", "strain", "antisigma", "arabinose", "aTc", "DHBA")
+group_vars    <- c("strain", "antisigma", "arabinose", "aTc", "DHBA")
+
+# ---- Strain groups ---------------------------------------------------------
+# Final strains used in the two-step timer paper figures
+# GFC0747 is excluded from final figures (uninsulated control only)
+final_strains <- c("GFC0734", "GFC0735", "GFC0738", "GFC0739",
+                   "GFC0740", "GFC0741", "GFC0742", "GFC0743")
+
+# ---- Plot axis breaks -------------------------------------------------------
+breaks       <- 10^(-10:10)
+minor_breaks <- rep(1:9, 21) * (10^rep(-10:10, each = 9))
+```
+
+---
+
+# Data loading
+
+## Raw plate reader data
+
+```{r load-raw}
+df_raw <- read_in_plates(data_files, pattern = "RW.csv")
+df_raw
+```
+
+## Metadata
+
+```{r load-meta}
+mdf <- read_in_meta(data_files, pattern = "metainfo.csv")
+mdf
+```
+
+## Join raw data and metadata
+
+```{r join}
+df <- df_raw |>
+  dplyr::left_join(mdf, by = c("well" = "Wells", "exp" = "exp"))
+df
+```
+
+## Pull strain names from metainfo
+
+```{r strain-names}
+# Pull all unique non-control strain names directly from the data
+# This automatically captures all strains without manual listing
+strains <- df |>
+  dplyr::filter(
+    !strain %in% c("blank"),
+    !is.na(strain)
+  ) |>
+  dplyr::pull(strain) |>
+  unique() |>
+  sort()
+
+strains
+```
+
+---
+
+# Blanking
+
+## QC: Check blank readings
+
+```{r check-blank}
+check_blank(df,
+            blank_variable    = "od600",
+            preinduction_time = it,
+            variable_to_color = "exp")
+```
+
+## Get average blank OD
+
+```{r blank-average}
+# Filter to a specific experiment if blank values differ across runs
+df |>
+  dplyr::filter(exp == 2) |>
+  get_blank_average(preinduction_time = it)
+```
+
+## Apply blank correction
+
+```{r blank-correct}
+# 384-well empirical blank OD (path-corrected): 0.118
+# Update average_blank_od from the get_blank_average() output above
+df_blank <- blank_plate(
+  data             = df,
+  average_blank_od = 0.118,
+  pc_factor        = pc_factor
+)
+
+df_blank
+```
+
+## Optional: remove wells with known pipetting errors
+
+Leave this chunk commented out unless there are confirmed issues.
+
+```{r remove-bad-wells, eval=FALSE}
+# df_blank <- df_blank |>
+#   dplyr::filter(!((well %in% c("A09","B09","C09","D09")) & exp == 1))
+```
+
+## QC: Plate overview plots
+
+```{r plate-overview-od, fig.width=14, fig.height=10}
+plot_plate(df_blank,
+           variable_to_plot     = "od600_blank",
+           variable_to_color    = "strain",
+           inductiontime        = it,
+           number_of_colors     = 6,
+           number_of_experiment = 8)
+```
+
+```{r plate-overview-lum, fig.width=14, fig.height=10}
+plot_plate(df_blank,
+           variable_to_plot     = "lum_blank",
+           variable_to_color    = "strain",
+           inductiontime        = it,
+           number_of_colors     = 6,
+           number_of_experiment = 9)
+```
+
+---
+
+# Averaging
+
+```{r average}
+df_av <- average_plate(df_blank, group_vars = group_vars_av)
+df_av
+```
+
+## Check replicate counts
+
+```{r replicate-counts}
+df_av |>
+  dplyr::mutate(count = stringr::str_count(replicate, pattern = "[A-Z][0-9]{2}")) |>
+  dplyr::summarise(av_count = mean(count), .by = strain)
+```
+
+---
+
+# Background luminescence
+
+Background is calculated from the pre-induction window (starttime to it)
+using each strain's own signal (`wildtype = FALSE`).
+
+```{r background}
+bg_expr <- df_av |>
+  get_background_lum(
+    value         = lum_blank_mean,
+    starttime     = starttime,
+    inductiontime = it,
+    group_vars    = group_vars,
+    wildtype      = FALSE
+  )
+
+bg_expr
+```
+
+---
+
+# Averaged kinetics plots
+
+## OD600 — all strains overlaid
+
+```{r plot-od-overlay, fig.width=7, fig.height=4}
+df_av |>
+  dplyr::filter(strain %in% final_strains) |>
+  plot_average_od(
+    variable_to_colour = "strain",
+    all_in_one         = TRUE
+  ) +
+  ggplot2::annotation_logticks(sides = "l")
+```
+
+## OD600 — per strain, faceted
+
+```{r plot-od-faceted, message=FALSE}
+for (strain_name in strains) {
+
+  plt <- plot_average_od(
+    df_av,
+    strain_to_plot     = strain_name,
+    variable_to_colour = "arabinose",
+    unit_of_colour     = "%",
+    inductiontime      = it,
+    grid_col           = "aTc",
+    grid_row           = "DHBA",
+    all_in_one         = FALSE
+  )
+
+  ggplot2::ggsave(
+    filename = file.path(plot_dir, paste0("2steptimer_", strain_name, "_OD.pdf")),
+    plot     = plt,
+    width = 160, height = 160, units = "mm", dpi = 300, scale = 1.5
+  )
+}
+```
+
+## Luminescence — example strain
+
+```{r plot-lum-example, fig.width=8, fig.height=6}
+# Change strain and filter conditions as needed for inspection
+df_av |>
+  dplyr::filter(
+    strain %in% c("GFC0738", "GFC0747"),
+    aTc  %in% c(2.5),
+    DHBA %in% c(250)
+  ) |>
+  plot_average_lum(
+    variable_to_colour = "arabinose",
+    unit_of_colour     = "%",
+    inductiontime      = it,
+    background_lum     = 137.4,
+    grid_col           = antisigma
+  )
+```
+
+---
+
+# Growth rate
+
+```{r growthrate}
+df_gr <- get_growthrate(
+  df_blank,
+  group_vars = c("strain", "antisigma", "aTc", "arabinose", "DHBA", "rep", "exp"),
+  starttime  = 6,
+  endtime    = 10
+)
+
+df_gr_av <- average_gr_data(df_gr, group_vars = group_vars)
+df_gr_av
+```
+
+---
+
+# Time delays
+
+## Calculate interpolated time delays (recommended)
+
+Uses cubic spline interpolation to find the precise time at which
+luminescence crosses `fc_threshold` × pre-induction baseline, removing
+quantisation error from discrete measurement intervals.
+
+```{r timedelay-spline}
+df_timedelay_all <- df_av |>
+  dplyr::filter(strain != "blank") |>
+  get_timedelay_splinefun(
+    bg_expr       = bg_expr,
+    group_vars    = group_vars,
+    foldchange    = fc_threshold,
+    inductiontime = it
+  )
+
+df_timedelay_all
+```
+
+## Plot luminescence kinetics with interpolated time delay
+
+Plots for all final strains, faceted by aTc (cols) × DHBA (rows).
+
+```{r plot-lum-timedelay, message=FALSE}
+for (strain_name in final_strains) {
+
+  plt <- plot_lumkinetic_with_timedelay(
+    .data              = df_av |>
+      dplyr::filter(aTc %in% c(0, 2.5), DHBA %in% c(0, 250)),
+    strain_to_plot     = strain_name,
+    df_timedelay       = df_timedelay_all,
+    inductiontime      = it,
+    variable_to_colour = "arabinose",
+    unit_of_colour     = "%",
+    background_lum     = 137.4,
+    grid_col           = "aTc",
+    grid_row           = "DHBA",
+    group_vars         = group_vars
+  ) +
+    ggplot2::annotation_logticks(sides = "l")
+
+  ggplot2::ggsave(
+    filename = file.path(
+      plot_dir,
+      paste0("2steptimer_", strain_name, "_LUM_interpolated.pdf")
+    ),
+    plot  = plt,
+    width = 160, height = 160, units = "mm", dpi = 300, scale = 1.5
+  )
+}
+```
+
+## Time delay heatmaps
+
+Heatmaps show delay in minutes across arabinose × aTc grid,
+faceted by DHBA concentration.
+
+```{r plot-delay-heatmap, message=FALSE}
+for (strain_name in final_strains) {
+
+  plt <- df_timedelay_all |>
+    dplyr::filter(strain == strain_name) |>
+    plot_timedelay_heatmap(
+      fill_variable = delay,
+      x_data        = "aTc",
+      y_data        = "arabinose",
+      x_unit        = "ng/ml",
+      y_unit        = "%",
+      inductiontime = it
+    ) +
+    ggplot2::facet_grid(cols = ggplot2::vars(DHBA))
+
+  ggplot2::ggsave(
+    filename = file.path(plot_dir, paste0("2steptimer_", strain_name, "_delay_heatmap.pdf")),
+    plot     = plt,
+    width = 160, height = 50, units = "mm", dpi = 300, scale = 1.5
+  )
+}
+```
+
+---
+
+# Dynamic range
+
+## Calculate fold-change at all time points
+
+```{r dynamic-range-all}
+df_av_fc_all <- get_dynamic_range_all(df_av, bg_expr, group_vars)
+```
+
+## Join time delays and fold-changes at endpoint
+
+Filters to the final time point before joining to avoid row fan-out.
+
+```{r delays-fc}
+df_fc_endpoint <- df_av_fc_all |>
+  dplyr::filter(
+    time == max(time),
+    .by  = all_of(group_vars)
+  )
+
+df_delays_fc <- df_timedelay_all |>
+  dplyr::left_join(df_fc_endpoint, by = group_vars)
+
+# Sanity check: row counts should match
+nrow(df_timedelay_all)
+nrow(df_delays_fc)
+
+df_delays_fc
+```
+
+## Dynamic range heatmaps
+
+```{r dynamic-range-heatmap, message=FALSE}
+for (strain_name in final_strains) {
+
+  plt <- df_av_fc_all |>
+    dplyr::summarise(
+      max_dynamicrange = max(fc_mean),
+      .by              = all_of(group_vars)
+    ) |>
+    dplyr::filter(strain == strain_name) |>
+    plot_dynamic_range_heatmap(
+      fill_variable = max_dynamicrange,
+      x_data        = "aTc",
+      y_data        = "arabinose",
+      x_unit        = "ng/ml",
+      y_unit        = "%"
+    ) +
+    ggplot2::facet_grid(cols = ggplot2::vars(DHBA))
+
+  ggplot2::ggsave(
+    filename = file.path(
+      plot_dir,
+      paste0("2steptimer_", strain_name, "_arabinose_vs_aTc_heatmap.pdf")
+    ),
+    plot  = plt,
+    width = 160, height = 50, units = "mm", dpi = 300, scale = 1.5
+  )
+}
+```
+
+## Dynamic range bar plots
+
+```{r dynamic-range-bar}
+df_av_fc <- average_dynamic_range(df_blank, bg_expr, group_vars)
+
+# Exclude outlier arabinose concentration if needed (arabinose = 0.0004)
+plot_dr <- df_av_fc |>
+  dplyr::filter(
+    strain   %in% final_strains,
+    arabinose != 0.0004
+  ) |>
+  plot_dynamic_range_averages(strain_group = final_strains)
+
+plot_dr
+
+ggplot2::ggsave(
+  filename = file.path(plot_dir, "2steptimer_dynamicrange_barplot.pdf"),
+  plot     = plot_dr,
+  width = 150, height = 125, units = "mm", dpi = 300, scale = 1.5
+)
+```
+
+## Maximum fold-change summary
+
+```{r max-foldchange}
+df_max_fc <- df_av_fc |>
+  dplyr::filter(strain %in% final_strains, arabinose != 0.0004) |>
+  dplyr::filter(
+    fold_change_mean == max(fold_change_mean),
+    .by = strain
+  )
+
+df_max_fc |>
+  ggplot2::ggplot(ggplot2::aes(
+    x    = reorder(strain, dplyr::desc(fold_change_mean)),
+    y    = fold_change_mean,
+    fill = interaction(aTc, DHBA)
+  )) +
+  ggplot2::geom_bar(
+    stat     = "identity",
+    width    = 0.5,
+    position = ggplot2::position_dodge(width = 0.5),
+    colour   = "black"
+  ) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin = pmax(fold_change_mean - fold_change_sd, 0.05),
+      ymax = fold_change_mean + fold_change_sd
+    ),
+    width    = 0.2,
+    position = ggplot2::position_dodge(width = 0.5),
+    colour   = "black"
+  ) +
+  ggplot2::scale_y_log10(
+    labels = function(x) parse(text = paste0("10^", log10(x))),
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_fill_viridis_d(direction = -1) +
+  ggplot2::labs(
+    x    = "strain",
+    y    = "Max. fold induction",
+    fill = "aTc.DHBA"
+  ) +
+  theme_timer() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 0.5, size = 7)
+  )
+
+ggplot2::ggsave(
+  filename = file.path(plot_dir, "2steptimer_max_foldchange.pdf"),
+  width = 150, height = 50, units = "mm", dpi = 300, scale = 1.5
+)
+```
+
+---
+
+# Delay vs fold-change scatter plot
+
+```{r delay-vs-fc, fig.width=5, fig.height=4}
+df_delays_fc |>
+  dplyr::filter(strain %in% final_strains) |>
+  plot_delay_vs_fc(
+    inductiontime = it,
+    as_inducer    = aTc,
+    legend        = FALSE
+  ) +
+  ggplot2::annotation_logticks(sides = "l")
+
+ggplot2::ggsave(
+  filename = file.path(plot_dir, "2steptimer_foldchange_vs_timedelay.pdf"),
+  width = 80, height = 50, units = "mm", dpi = 300
+)
+```
+
+---
+
+# Dose-response curves
+
+```{r dose-response, message=FALSE}
+for (strain_name in final_strains) {
+
+  plt <- df_av |>
+    dplyr::filter(
+      strain == strain_name,
+      aTc  %in% c(0, 2.5),
+      DHBA %in% c(0, 250)
+    ) |>
+    plot_doseresponse()
+
+  ggplot2::ggsave(
+    filename = file.path(plot_dir, paste0("2steptimer_", strain_name, "_doseresponse.pdf")),
+    plot     = plt,
+    width = 80, height = 80, units = "mm", dpi = 300, scale = 1.5
+  )
+}
+```
+
+## Export dose-response data
+
+```{r dose-response-export}
+df_doseresponse <- df_av |>
+  dplyr::filter(
+    strain   %in% final_strains,
+    time     == max(time),
+    aTc      %in% c(0, 2.5),
+    DHBA     %in% c(0, 250)
+  ) |>
+  dplyr::select(strain, antisigma, arabinose, aTc, DHBA, lum_blank_mean, lum_blank_sd)
+
+readr::write_csv(
+  df_doseresponse,
+  file.path(plot_dir, "2step_doseresponse.csv")
+)
+```
+
+---
+
+# Significance testing
+
+Tests whether threshold induction (aTc or DHBA independently) significantly
+changes maximum fold-change per strain, using a paired t-test on
+log10(fold-change) across biological replicates.
+
+```{r significance}
+# Test aTc threshold effect
+df_atc_sign <- test_threshold_significance(
+  .data             = df_blank,
+  bg_expr           = bg_expr,
+  group_vars        = group_vars,
+  strain_group      = final_strains,
+  threshold_inducer = "aTc"
+)
+
+# Test DHBA threshold effect
+df_dhba_sign <- test_threshold_significance(
+  .data             = df_blank,
+  bg_expr           = bg_expr,
+  group_vars        = group_vars,
+  strain_group      = final_strains,
+  threshold_inducer = "DHBA"
+)
+
+# Combine and export
+sig_results <- dplyr::bind_rows(
+  df_atc_sign  |> dplyr::mutate(inducer = "aTc"),
+  df_dhba_sign |> dplyr::mutate(inducer = "DHBA")
+)
+
+sig_results
+
+readr::write_csv(
+  sig_results,
+  file.path(plot_dir, "2step_significance_threshold_vs_no_threshold.csv")
+)
+```
