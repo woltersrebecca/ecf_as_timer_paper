@@ -1,4 +1,4 @@
-# ECF Sigma and Anti-Sigma Factor Timer Paper — Data Analysis
+# Tunable and orthogonal ECF and anti-σ threshold gates for temporal control of heterologous gene expression — Data Analysis
 
 **Authors:** Rebecca Wolters, Stefano Vecchione, Angelika Diel, Georg Fritz  
 **Institution:** The University of Western Australia, University of Marburg
