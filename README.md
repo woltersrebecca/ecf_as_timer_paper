@@ -31,8 +31,8 @@ and anti-sigma factors. Analysis covers:
 Raw data are plate reader measurements from a BioTek plate reader exported
 as .csv files using Gen5 software. Each experiment folder contains:
 
-- `*_exp#.csv` — raw OD600 and luminescence measurements
-- `metainfo.csv` — plate layout in plater format describing strain,
+- `*.csv` — raw OD600 and luminescence measurements
+- `_metainfo.csv` — plate layout in plater format describing strain,
   inducer concentrations, and well assignments per experiment
 
 ---
